@@ -202,6 +202,16 @@ module Training
       ping('aws.amazon.com')
     end
 
+    banner 'Connection to CloudShare'
+    def cloudshare_connect
+      ping('www.cloudshare.com')
+    end
+
+    banner 'Connection to CloudShare Labs'
+    def cloudshare_labs_connect
+      ping('use.cloudshare.com')
+    end
+
     banner 'Resolving DNS for "manage.opscode.com"'
     def enterprise_chef_dns
       !Resolv::DNS.new.getresources('manage.opscode.com', Resolv::DNS::Resource::IN::A).empty?
