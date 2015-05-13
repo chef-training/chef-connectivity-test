@@ -1,0 +1,328 @@
+
+module Training
+  # The global timeout state
+  TIMEOUT = 10
+
+  # A utility class for creating a "check", such as networking
+  #
+  # @author Seth Vargo <sethvargo@gmail.com>
+  class Checker
+    # Helper method for silencing stdout
+    def silence(&block)
+      old = $stdout.dup
+      $stdout.reopen(RbConfig::CONFIG['host_os'] =~ /mswin|mingw/ ? 'NUL:' : '/dev/null')
+      $stdout.sync = true
+      yield
+    ensure
+      $stdout.reopen(old)
+    end
+
+    class << self
+      # Execute each method, in order, with response handling and checking
+      def run!
+        @_pre.call if @_pre.respond_to?(:call)
+
+        _checks.each do |key, check|
+          run_check(check)
+        end
+
+        @_post.call if @_post.respond_to?(:call)
+      end
+
+      # Block to execute before all checks are run (setup)
+      def pre(&block)
+        @_pre = block
+      end
+
+      # Block to execute after all checks are run (cleanup)
+      def post(&block)
+        @_post = block
+      end
+
+      # Banner text to display when executing a check; if no parameter
+      # is given, the banner is returned - otherwise it is set to `text`
+      #
+      # @raise [ArgumentError]
+      #   if there is no banner set
+      #
+      # @param [String, nil] text
+      #   the text to set the banner
+      #
+      # @return [String]
+      #   the banner
+      def banner(text = nil)
+        if text.nil?
+          @banner || raise(ArgumentError, "No banner given at #{caller[1]}")
+        else
+          @banner = text
+        end
+      end
+
+      # The success message (default is 'OK')
+      #
+      # @see {banner} for usage
+      def success_message(text = nil)
+        text.nil? ? @success_message ||= 'OK' : @success_message = text
+      end
+
+      # The failure message (default is 'FAIL')
+      #
+      # @see {banner} for usage
+      def failure_message(text = nil)
+        text.nil? ? @failure_message ||= 'FAIL!' : @failure_message = text
+      end
+
+      # Special Ruby method that is fired whenever a new method is added;
+      # since classes will inherit from the parent class, this is called
+      # as the class is read.
+      def method_added(check)
+        return unless public_method_defined?(check)
+
+        _checks[check] = Training::Check.new(
+          check,
+          banner,
+          success_message,
+          failure_message,
+        )
+
+        @banner = nil
+        @success_message = nil
+        @failure_message = nil
+      end
+
+      private
+        def _checks
+          @_checks ||= {}
+        end
+
+        def _instance
+          @_instance ||= self.new
+        end
+
+        def run_check(check)
+          print check.banner + '... '
+
+          result = Timeout::timeout(TIMEOUT) do
+            _instance.send(check.method)
+          end
+
+          if result == true
+            puts check.success_message
+          elsif result == false
+            puts check.failure_message
+          else
+            puts "WARN: check was not pure true or false result. Assuming truthy/falsey - this is probably not what you want"
+            if result
+              puts check.success_message
+            else
+              puts check.failure_message
+            end
+          end
+        rescue => e
+          puts 'ERROR!'
+          puts
+          puts "  #{e.message}"
+          puts
+        end
+    end
+  end
+
+  # A single class representing a "check"; a wrapper around the check method
+  #
+  # @author Seth Vargo <sethvargo@gmail.com>
+  class Check
+    attr_reader :banner,
+                :method,
+                :success_message,
+                :failure_message
+
+    def initialize(method, banner, success_message, failure_message)
+      @method = method
+      @banner = banner
+      @success_message = success_message
+      @failure_message = failure_message
+    end
+
+    def to_s
+      "#<Training::Check #{method}" <<
+        " banner: '#{banner}'," <<
+        " success: '#{success_message}'," <<
+        " failure: '#{failure_message}'" <<
+      ">"
+    end
+  end
+
+
+
+  # Networking connectivity tests
+  #
+  # @author Seth Vargo <sethvargo@gmail.com>
+  class Networking < Checker
+    require 'net/ssh'
+    require 'resolv'
+    require 'socket'
+    require 'timeout'
+
+    banner 'Resolving DNS for "google.com"'
+    def google_dns
+      !Resolv::DNS.new.getresources('google.com', Resolv::DNS::Resource::IN::A).empty?
+    end
+
+    banner 'Connecting to Google'
+    def google_connect
+      ping('google.com')
+    end
+
+    banner 'Resolving DNS for "aws.amazon.com"'
+    def ec2_dns
+      !Resolv::DNS.new.getresources('aws.amazon.com', Resolv::DNS::Resource::IN::A).empty?
+    end
+
+    banner 'Connection to EC2'
+    def ec2_connect
+      ping('aws.amazon.com')
+    end
+
+    banner 'Connection to CloudShare'
+    def cloudshare_connect
+      ping('www.cloudshare.com')
+    end
+
+    banner 'Connection to CloudShare Labs'
+    def cloudshare_labs_connect
+      ping('use.cloudshare.com')
+    end
+
+    banner 'Resolving DNS for "manage.opscode.com"'
+    def enterprise_chef_dns
+      !Resolv::DNS.new.getresources('manage.opscode.com', Resolv::DNS::Resource::IN::A).empty?
+    end
+
+    banner 'Connecting to Enterprise Chef, Hosted'
+    def enterprise_chef_connect
+      ping('manage.opscode.com')
+    end
+
+    banner 'Checking SSH connection'
+    def ssh_connect
+      !!Net::SSH.start('github.com', 'git')
+    end
+
+    private
+      def ping(host, timeout = Training::TIMEOUT)
+        Timeout::timeout(timeout) { TCPSocket.new(host, 80).close }
+        true
+      rescue Errno::ECONNREFUSED
+        true
+      rescue Timeout::Error, StandardError => e
+        false
+      end
+  end
+
+  # Chef connectivity tests
+  #
+  # @author Seth Vargo <sethvargo@gmail.com>
+  class Chef < Checker
+    require 'chef/api_client'
+    require 'chef/cookbook_loader'
+    require 'chef/cookbook_uploader'
+    require 'chef/knife'
+    require 'chef/knife/cookbook_create'
+    require 'chef/rest'
+    require 'chef/search/query'
+
+    pre do
+      ::Chef::Knife.new.configure_chef
+    end
+
+    banner 'EDITOR set'
+    def editor_set
+      !!ENV['editor'] || !!ENV['EDITOR']
+    end
+
+    banner 'Listing clients'
+    def client_list
+      !::Chef::ApiClient.list.empty?
+    end
+
+    banner 'Adding a client'
+    def client_add
+      client = ::Chef::ApiClient.new
+      client.name('training-test')
+      client.save
+
+      ::Chef::ApiClient.list.any? { |_, client| client =~ /training\-test$/ }
+    end
+
+    banner 'Showing a client'
+    def client_show
+      client = ::Chef::ApiClient.load('training-test')
+      true
+    end
+
+    banner 'Updating a client'
+    def client_update
+      client = ::Chef::ApiClient.load('training-test')
+      client.public_key(OpenSSL::PKey::RSA.new(2048).public_key.to_pem)
+      client.save
+
+      true
+    end
+
+    banner 'Deleting a client'
+    def client_delete
+      client = ::Chef::ApiClient.load('training-test')
+      client.destroy
+
+      !::Chef::ApiClient.list.any? { |_, client| client =~ /training\-test$/ }
+    end
+
+    banner 'Creating a cookbook'
+    def cookbook_create
+      silence do
+        generator = ::Chef::Knife::CookbookCreate.new
+        generator.create_cookbook(Dir.pwd, 'training-test', 'default', 'apachev2')
+        generator.create_changelog(Dir.pwd, 'training-test')
+        generator.create_readme(Dir.pwd, 'training-test', 'md')
+        generator.create_metadata(Dir.pwd, 'training-test', 'apachev2', 'default', 'default', 'md')
+      end
+
+      ::File.directory?('training-test')
+    end
+
+    banner 'Uploading a cookbook'
+    def cookbook_upload
+      cookbook = ::Chef::CookbookLoader.new(Dir.pwd).load_cookbook('training-test')
+      !!::Chef::CookbookUploader.new(cookbook, Dir.pwd).upload_cookbooks
+    end
+
+    banner 'Listing cookbooks'
+    def cookbook_list
+      rest = ::Chef::REST.new(::Chef::Config[:chef_server_url])
+      !!rest.get_rest('/cookbooks')
+    end
+
+    banner 'Deleting a cookbook'
+    def cookbook_delete
+      rest = ::Chef::REST.new(::Chef::Config[:chef_server_url])
+      !!rest.delete_rest('cookbooks/training-test/0.1.0')
+    end
+
+    banner 'Downloading a cookbook (community)'
+    def cookbook_download
+      rest = ::Chef::REST.new(::Chef::Config[:chef_server_url], false, false)
+      rest.sign_on_redirect = false
+
+      info = rest.get_rest('https://cookbooks.opscode.com/api/v1/cookbooks/apache2/versions/1_0_0')
+      tmp = rest.get(info['file'], true)
+      ::FileUtils.cp(tmp.path, File.join(Dir.pwd, 'apache2.tar.gz'))
+      ::File.exist?('apache2.tar.gz')
+    end
+
+    banner 'Searching'
+    def search
+      search = ::Chef::Search::Query.new
+      !search.search('client', '*:*').empty?
+    end
+  end
+end
